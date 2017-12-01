@@ -101,6 +101,7 @@
         <module>routeradvertisement</module>
         <module>t3</module>
         <module>simplefabric</module>
+        <module>imr</module>
     </modules>
 
     <properties>

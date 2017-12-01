@@ -233,6 +233,7 @@ ONOS_APPS = [
     '//apps/simplefabric:onos-apps-simplefabric-oar',
     '//apps/kafka-integration:onos-apps-kafka-integration-oar',
     '//apps/rabbitmq:onos-apps-rabbitmq-oar',
+    '//apps/imr:onos-apps-imr-oar',
 ]
 
 PROTOCOL_APPS = [
@@ -262,6 +263,8 @@ APP_JARS = [
     '//apps/routing-api:onos-apps-routing-api',
     '//apps/dhcp/api:onos-apps-dhcp-api',
     '//apps/dhcp/app:onos-apps-dhcp-app',
+    '//apps/imr/api:onos-apps-imr-api',
+    '//apps/imr/app:onos-apps-imr-app',
     '//apps/dhcprelay:onos-apps-dhcprelay',
     '//apps/fwd:onos-apps-fwd',
     '//apps/iptopology-api:onos-apps-iptopology-api',
