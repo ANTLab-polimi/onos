@@ -237,13 +237,13 @@ public class IntentMonitorAndRerouteManager implements IntentMonitorAndRerouteSe
 
 
     /**
-     * Generates a new {@Link LinkCollectionIntent} applying the new path.
+     * Generates a new {@Link PointToPointIntent} applying the new path.
      * @param links List of links of the new path.
      * @param intentKey Key of the intent you want to re-route.
      * @param appId Application id that submits initially the intent.
      * @return The new intent, if not possibile it will return the old intent already installed.
      */
-    private ConnectivityIntent generateLinkCollectionIntent(
+    private ConnectivityIntent generatePointToPointIntent(
             List<Link> links,
             Key intentKey,
             ApplicationId appId) {
@@ -264,18 +264,17 @@ public class IntentMonitorAndRerouteManager implements IntentMonitorAndRerouteSe
         }
 
         // Now generate the new intent
-        LinkCollectionIntent newIntent = LinkCollectionIntent.builder()
+        PointToPointIntent newIntent = PointToPointIntent.builder()
                 .appId(oldIntent.appId())
                 .key(intentKey)
                 .selector(oldIntent.selector())
-                .filteredIngressPoints(ImmutableSet.copyOf(cpPair.getLeft()))
-                .filteredEgressPoints(ImmutableSet.copyOf(cpPair.getRight()))
+                //TODO: find an alternative to iterator().next()
+                .filteredIngressPoint(cpPair.getLeft().iterator().next())
+                .filteredEgressPoint(cpPair.getRight().iterator().next())
                 .treatment(oldIntent.treatment())
                 .priority(oldIntent.priority())
                 .constraints(oldIntent.constraints())
-                .links(ImmutableSet.copyOf(links))
-                //TODO: is there a way to get from the old intent?
-                .applyTreatmentOnEgress(true)
+                .suggestedPath(links)
                 .build();
 
         return newIntent;
@@ -318,7 +317,7 @@ public class IntentMonitorAndRerouteManager implements IntentMonitorAndRerouteSe
         List<Link> links = createPathFromDeviceList(currentPath.path());
 
         // Generate the new Link collection intent, if not possible it will return the old intent
-        ConnectivityIntent intent = generateLinkCollectionIntent(links, key, appId);
+        ConnectivityIntent intent = generatePointToPointIntent(links, key, appId);
         storeMonitoredIntent(intent);
         intentService.submit(intent);
         return true;
