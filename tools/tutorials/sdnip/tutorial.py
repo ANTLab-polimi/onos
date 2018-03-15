@@ -5,6 +5,8 @@ from mininet.net import Mininet
 from mininet.cli import CLI
 from mininet.log import setLogLevel, info, debug
 from mininet.node import Host, RemoteController
+import os
+import time
 
 QUAGGA_DIR = '/usr/lib/quagga'
 # Must exist and be owned by quagga user (quagga:quagga by default on Ubuntu)
@@ -126,12 +128,22 @@ class SdnIpTopo( Topo ):
 topos = { 'sdnip' : SdnIpTopo }
 
 if __name__ == '__main__':
-    setLogLevel('debug')
+    #setLogLevel('debug')
+
+    if 'ONOS_ROOT' not in os.environ:
+        print 'You must run "sudo -E python %s" to preserve environment variables!' % __file__
+        exit()
+
     topo = SdnIpTopo()
 
     net = Mininet(topo=topo, controller=RemoteController)
 
     net.start()
+
+    print 'Waiting 20 seconds...'
+    time.sleep(20)
+    print 'Executing onos-netcfg...'
+    os.system('$ONOS_ROOT/tools/package/runtime/bin/onos-netcfg localhost configs/network-cfg.json')
 
     CLI(net)
 
