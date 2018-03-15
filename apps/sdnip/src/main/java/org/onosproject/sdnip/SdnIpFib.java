@@ -30,6 +30,8 @@ import org.onlab.packet.MacAddress;
 import org.onlab.packet.VlanId;
 import org.onosproject.core.ApplicationId;
 import org.onosproject.core.CoreService;
+import org.onosproject.imr.IntentMonitorAndRerouteService;
+import org.onosproject.net.intent.PointToPointIntent;
 import org.onosproject.net.intf.Interface;
 import org.onosproject.net.intf.InterfaceEvent;
 import org.onosproject.net.intf.InterfaceListener;
@@ -89,6 +91,9 @@ public class SdnIpFib {
     @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
     protected RouteService routeService;
 
+    @Reference(cardinality = ReferenceCardinality.MANDATORY_UNARY)
+    protected IntentMonitorAndRerouteService intentMonitorAndRerouteService;
+
     private final InternalRouteListener routeListener = new InternalRouteListener();
     private final InternalInterfaceListener interfaceListener = new InternalInterfaceListener();
     private final InternalNetworkConfigListener networkConfigListener =
@@ -100,6 +105,15 @@ public class SdnIpFib {
             = ImmutableList.of(new PartialFailureConstraint());
 
     private final Map<IpPrefix, MultiPointToSinglePointIntent> routeIntents
+            = new ConcurrentHashMap<>();
+
+    private final boolean USE_POINT_TO_POINT_INTENTS = true;
+
+    //TODO POLIMI: should we use Pair<IpPrefix, IpPrefix> instead of Key?
+    private final Map<Key, PointToPointIntent> p2pRouteIntents
+            = new ConcurrentHashMap<>();
+
+    private final Map<ConnectPoint, Set<ResolvedRoute>> resolvedRoutesPerCP
             = new ConcurrentHashMap<>();
 
     private ApplicationId appId;
@@ -120,34 +134,60 @@ public class SdnIpFib {
 
     private void update(ResolvedRoute route) {
         synchronized (this) {
-            IpPrefix prefix = route.prefix();
             EncapsulationType encap = encap();
-            MultiPointToSinglePointIntent intent =
-                    generateRouteIntent(prefix,
-                                        route.nextHop(),
-                                        route.nextHopMac(),
-                                        encap);
+            if (USE_POINT_TO_POINT_INTENTS) {
+                updateResolvedRoutesFromCP(route);
 
-            if (intent == null) {
-                log.debug("No interface found for route {}", route);
-                return;
+                List<PointToPointIntent> arrayIntent =
+                        generateP2PIntentsFromToRoute(route, encap);
+
+                arrayIntent.forEach(intent -> {
+                    p2pRouteIntents.put(intent.key(), intent);
+                    intentMonitorAndRerouteService.startMonitorIntent(intent.key());
+                    intentSynchronizer.submit(intent);
+                });
+            } else {
+                IpPrefix prefix = route.prefix();
+                MultiPointToSinglePointIntent intent =
+                        generateRouteIntent(prefix,
+                                            route.nextHop(),
+                                            route.nextHopMac(),
+                                            encap);
+
+                if (intent == null) {
+                    log.debug("No interface found for route {}", route);
+                    return;
+                }
+
+                routeIntents.put(prefix, intent);
+                intentSynchronizer.submit(intent);
             }
-
-            routeIntents.put(prefix, intent);
-            intentSynchronizer.submit(intent);
         }
     }
 
     private void withdraw(ResolvedRoute route) {
         synchronized (this) {
-            IpPrefix prefix = route.prefix();
-            MultiPointToSinglePointIntent intent = routeIntents.remove(prefix);
-            if (intent == null) {
-                log.trace("No intent in routeIntents to delete for prefix: {}",
-                          prefix);
-                return;
+            if (USE_POINT_TO_POINT_INTENTS) {
+                // We need to remove all the PointToPointIntent from/to this prefix
+                List<Key> intentKeys = relatedIntentKeys(route);
+                removeLearnedRoutesFromCP(route);
+                intentKeys.forEach(key -> {
+                    PointToPointIntent intent = p2pRouteIntents.remove(key);
+                    if (intent != null) {
+                        intentMonitorAndRerouteService.stopMonitorIntent(key);
+                        intentSynchronizer.withdraw(intent);
+                    }
+                });
+            } else {
+                IpPrefix prefix = route.prefix();
+                MultiPointToSinglePointIntent intent = routeIntents.remove(prefix);
+                if (intent == null) {
+                    log.trace("No intent in routeIntents to delete for prefix: {}",
+                              prefix);
+                    return;
+                }
+                intentSynchronizer.withdraw(intent);
             }
-            intentSynchronizer.withdraw(intent);
         }
     }
 
@@ -188,7 +228,7 @@ public class SdnIpFib {
 
         // TODO this should be only peering interfaces
         interfaceService.getInterfaces().forEach(intf -> {
-            // Get ony ingress interfaces with IPs configured
+            // Get only ingress interfaces with IPs configured
             if (validIngressIntf(intf, egressInterface)) {
                 TrafficSelector.Builder selector =
                         buildIngressTrafficSelector(intf, prefix);
@@ -232,32 +272,38 @@ public class SdnIpFib {
 
     private void addInterface(Interface intf) {
         synchronized (this) {
-            for (Map.Entry<IpPrefix, MultiPointToSinglePointIntent> entry : routeIntents.entrySet()) {
-                // Retrieve the IP prefix and affected intent
-                IpPrefix prefix = entry.getKey();
-                MultiPointToSinglePointIntent intent = entry.getValue();
+            if (USE_POINT_TO_POINT_INTENTS) {
+                //no action is required until we receive an announcement from
+                //this port, but this event will be handled by update()
+                return;
+            } else {
+                for (Map.Entry<IpPrefix, MultiPointToSinglePointIntent> entry : routeIntents.entrySet()) {
+                    // Retrieve the IP prefix and affected intent
+                    IpPrefix prefix = entry.getKey();
+                    MultiPointToSinglePointIntent intent = entry.getValue();
 
-                // Add new ingress FilteredConnectPoint
-                Set<FilteredConnectPoint> ingressFilteredCPs =
-                        Sets.newHashSet(intent.filteredIngressPoints());
+                    // Add new ingress FilteredConnectPoint
+                    Set<FilteredConnectPoint> ingressFilteredCPs =
+                            Sets.newHashSet(intent.filteredIngressPoints());
 
-                // Create the new traffic selector
-                TrafficSelector.Builder selector =
-                        buildIngressTrafficSelector(intf, prefix);
+                    // Create the new traffic selector
+                    TrafficSelector.Builder selector =
+                            buildIngressTrafficSelector(intf, prefix);
 
-                // Create the Filtered ConnectPoint and add it to the existing set
-                FilteredConnectPoint newIngressFilteredCP =
-                        new FilteredConnectPoint(intf.connectPoint(), selector.build());
-                ingressFilteredCPs.add(newIngressFilteredCP);
+                    // Create the Filtered ConnectPoint and add it to the existing set
+                    FilteredConnectPoint newIngressFilteredCP =
+                            new FilteredConnectPoint(intf.connectPoint(), selector.build());
+                    ingressFilteredCPs.add(newIngressFilteredCP);
 
-                // Create new intent
-                MultiPointToSinglePointIntent newIntent =
-                        MultiPointToSinglePointIntent.builder(intent)
-                                .filteredIngressPoints(ingressFilteredCPs)
-                                .build();
+                    // Create new intent
+                    MultiPointToSinglePointIntent newIntent =
+                            MultiPointToSinglePointIntent.builder(intent)
+                                    .filteredIngressPoints(ingressFilteredCPs)
+                                    .build();
 
-                routeIntents.put(entry.getKey(), newIntent);
-                intentSynchronizer.submit(newIntent);
+                    routeIntents.put(entry.getKey(), newIntent);
+                    intentSynchronizer.submit(newIntent);
+                }
             }
         }
     }
@@ -267,55 +313,64 @@ public class SdnIpFib {
      */
     private void removeInterface(Interface intf) {
         synchronized (this) {
-            for (Map.Entry<IpPrefix, MultiPointToSinglePointIntent> entry : routeIntents.entrySet()) {
-                // Retrieve the IP prefix and intent possibly affected
-                IpPrefix prefix = entry.getKey();
-                MultiPointToSinglePointIntent intent = entry.getValue();
+            if (USE_POINT_TO_POINT_INTENTS) {
+                // It's like all the routes received from this interface
+                // were withdrawn
+                ConnectPoint cp = intf.connectPoint();
+                if (resolvedRoutesPerCP.containsKey(cp)) {
+                    resolvedRoutesPerCP.get(cp).forEach(route -> withdraw(route));
+                }
+            } else {
+                for (Map.Entry<IpPrefix, MultiPointToSinglePointIntent> entry : routeIntents.entrySet()) {
+                    // Retrieve the IP prefix and intent possibly affected
+                    IpPrefix prefix = entry.getKey();
+                    MultiPointToSinglePointIntent intent = entry.getValue();
 
-                // The interface removed might be an ingress interface, so the
-                // selector needs to match on the interface tagging params and
-                // on the prefix
-                TrafficSelector.Builder ingressSelector =
-                        buildIngressTrafficSelector(intf, prefix);
-                FilteredConnectPoint removedIngressFilteredCP =
-                        new FilteredConnectPoint(intf.connectPoint(),
-                                                 ingressSelector.build());
+                    // The interface removed might be an ingress interface, so the
+                    // selector needs to match on the interface tagging params and
+                    // on the prefix
+                    TrafficSelector.Builder ingressSelector =
+                            buildIngressTrafficSelector(intf, prefix);
+                    FilteredConnectPoint removedIngressFilteredCP =
+                            new FilteredConnectPoint(intf.connectPoint(),
+                                                     ingressSelector.build());
 
-                // The interface removed might be an egress interface, so the
-                // selector needs to match only on the interface tagging params
-                TrafficSelector.Builder selector = buildTrafficSelector(intf);
-                FilteredConnectPoint removedEgressFilteredCP =
-                        new FilteredConnectPoint(intf.connectPoint(), selector.build());
+                    // The interface removed might be an egress interface, so the
+                    // selector needs to match only on the interface tagging params
+                    TrafficSelector.Builder selector = buildTrafficSelector(intf);
+                    FilteredConnectPoint removedEgressFilteredCP =
+                            new FilteredConnectPoint(intf.connectPoint(), selector.build());
 
-                if (intent.filteredEgressPoint().equals(removedEgressFilteredCP)) {
-                     // The interface is an egress interface for the intent.
-                     // This intent just lost its head. Remove it and let higher
-                     // layer routing reroute
-                    intentSynchronizer.withdraw(routeIntents.remove(entry.getKey()));
-                } else {
-                    if (intent.filteredIngressPoints().contains(removedIngressFilteredCP)) {
-                         // The FilteredConnectPoint is an ingress
-                         // FilteredConnectPoint for the intent
-                        Set<FilteredConnectPoint> ingressFilteredCPs =
-                                Sets.newHashSet(intent.filteredIngressPoints());
+                    if (intent.filteredEgressPoint().equals(removedEgressFilteredCP)) {
+                        // The interface is an egress interface for the intent.
+                        // This intent just lost its head. Remove it and let higher
+                        // layer routing reroute
+                        intentSynchronizer.withdraw(routeIntents.remove(entry.getKey()));
+                    } else {
+                        if (intent.filteredIngressPoints().contains(removedIngressFilteredCP)) {
+                            // The FilteredConnectPoint is an ingress
+                            // FilteredConnectPoint for the intent
+                            Set<FilteredConnectPoint> ingressFilteredCPs =
+                                    Sets.newHashSet(intent.filteredIngressPoints());
 
-                        // Remove FilteredConnectPoint from the existing set
-                        ingressFilteredCPs.remove(removedIngressFilteredCP);
+                            // Remove FilteredConnectPoint from the existing set
+                            ingressFilteredCPs.remove(removedIngressFilteredCP);
 
-                        if (!ingressFilteredCPs.isEmpty()) {
-                             // There are still ingress points. Create a new
-                             // intent and resubmit
-                            MultiPointToSinglePointIntent newIntent =
-                                    MultiPointToSinglePointIntent.builder(intent)
-                                            .filteredIngressPoints(ingressFilteredCPs)
-                                            .build();
+                            if (!ingressFilteredCPs.isEmpty()) {
+                                // There are still ingress points. Create a new
+                                // intent and resubmit
+                                MultiPointToSinglePointIntent newIntent =
+                                        MultiPointToSinglePointIntent.builder(intent)
+                                                .filteredIngressPoints(ingressFilteredCPs)
+                                                .build();
 
-                            routeIntents.put(entry.getKey(), newIntent);
-                            intentSynchronizer.submit(newIntent);
-                        } else {
-                             // No more ingress FilteredConnectPoint. Withdraw
-                             //the intent
-                            intentSynchronizer.withdraw(routeIntents.remove(entry.getKey()));
+                                routeIntents.put(entry.getKey(), newIntent);
+                                intentSynchronizer.submit(newIntent);
+                            } else {
+                                // No more ingress FilteredConnectPoint. Withdraw
+                                //the intent
+                                intentSynchronizer.withdraw(routeIntents.remove(entry.getKey()));
+                            }
                         }
                     }
                 }
@@ -454,6 +509,233 @@ public class SdnIpFib {
         } else {
             return sdnIpConfig.encap();
         }
+    }
+
+    /*
+     * It generates a list of PointToPointIntent towards a given route from any
+     * other route received from other peering interfaces. The same is done for
+     * the reverse direction.
+     */
+    private List<PointToPointIntent> generateP2PIntentsFromToRoute(
+            ResolvedRoute route, EncapsulationType encap) {
+        List<PointToPointIntent> intentsList = new ArrayList<>();
+
+        // Find the attachment point (egress interface) of the next hop
+        Interface egressInterface =
+                interfaceService.getMatchingInterface(route.nextHop());
+        if (egressInterface == null) {
+            log.warn("No outgoing interface found for {}",
+                     route.nextHop());
+            return intentsList;
+        }
+
+        log.debug("Generating intents from/to prefix {}", route.prefix());
+
+        // TODO this should be only peering interfaces
+        interfaceService.getInterfaces().forEach(ingressInterface -> {
+            // Get only ingress interfaces with IPs configured
+            if (validIngressIntf(ingressInterface, egressInterface)) {
+                //"ingressInterface" is any peering interface other than the
+                // one we just received the announcement from
+                if (resolvedRoutesPerCP.containsKey(ingressInterface.connectPoint())) {
+                    resolvedRoutesPerCP.get(ingressInterface.connectPoint()).forEach(
+                            otherRoute -> {
+                                if (sameIPVersion(route.prefix(), otherRoute.prefix())) {
+                                    // Intent towards "egressInterface"
+                                    PointToPointIntent intent1 =
+                                            generateRouteToRouteIntent(ingressInterface,
+                                                                       otherRoute,
+                                                                       egressInterface,
+                                                                       route,
+                                                                       encap);
+                                    intentsList.add(intent1);
+
+                                    // Intent from "egressInterface"
+                                    PointToPointIntent intent2 =
+                                            generateRouteToRouteIntent(egressInterface,
+                                                                       route,
+                                                                       ingressInterface,
+                                                                       otherRoute,
+                                                                       encap);
+                                    intentsList.add(intent2);
+                                }
+                            }
+                    );
+                }
+            }
+        });
+        return intentsList;
+    }
+
+    /*
+     * It generates a PointToPointIntent from interfaceSrc to interfaceDst,
+     * matching on src prefix routeSrc and dst prefix routeDst and setting the
+     * eth dst address to the next hop towards routeDst.
+     */
+    private PointToPointIntent generateRouteToRouteIntent(
+            Interface interfaceSrc, ResolvedRoute routeSrc,
+            Interface interfaceDst, ResolvedRoute routeDst,
+            EncapsulationType encap) {
+        // Build the ingress selector for VLAN Id
+        TrafficSelector.Builder selectorIn =
+                buildTrafficSelector(interfaceSrc);
+        FilteredConnectPoint ingressFilteredCP =
+                new FilteredConnectPoint(interfaceSrc.connectPoint(),
+                                         selectorIn.build());
+
+        // Build the egress selector for VLAN Id
+        TrafficSelector.Builder selectorOut =
+                buildTrafficSelector(interfaceDst);
+        FilteredConnectPoint egressFilteredCP =
+                new FilteredConnectPoint(interfaceDst.connectPoint(),
+                                         selectorOut.build());
+
+        // Build treatment: rewrite the destination MAC address
+        TrafficTreatment.Builder treatment = DefaultTrafficTreatment.builder()
+                .setEthDst(routeDst.nextHopMac());
+
+        IpPrefix ingressPrefix = routeSrc.prefix();
+        IpPrefix egressPrefix = routeDst.prefix();
+
+        //Match on IpSrc+IpDst
+        TrafficSelector.Builder selector = DefaultTrafficSelector.builder();
+        if (ingressPrefix.isIp4() && egressPrefix.isIp4()) {
+            selector.matchEthType(Ethernet.TYPE_IPV4);
+            if (ingressPrefix.prefixLength() != 0) {
+                selector.matchIPSrc(ingressPrefix);
+            }
+            if (egressPrefix.prefixLength() != 0) {
+                selector.matchIPDst(egressPrefix);
+            }
+        } else {
+            selector.matchEthType(Ethernet.TYPE_IPV6);
+            if (ingressPrefix.prefixLength() != 0) {
+                selector.matchIPv6Src(ingressPrefix);
+            }
+            if (egressPrefix.prefixLength() != 0) {
+                selector.matchIPv6Dst(egressPrefix);
+            }
+        }
+
+        // Set priority
+        int priority =
+                routeDst.prefix().prefixLength() * PRIORITY_MULTIPLIER
+                        + PRIORITY_OFFSET;
+
+        // Set key
+        Key key = Key.of(ingressPrefix + "-" + egressPrefix, appId);
+
+        PointToPointIntent.Builder intentBuilder =
+                PointToPointIntent.builder()
+                        .selector(selector.build())
+                        .appId(appId)
+                        .key(key)
+                        .filteredIngressPoint(ingressFilteredCP)
+                        .filteredEgressPoint(egressFilteredCP)
+                        .treatment(treatment.build())
+                        .priority(priority)
+                        .constraints(CONSTRAINTS);
+
+        // TODO POLIMI?
+        //setEncap(intentBuilder, CONSTRAINTS, encap);
+
+        return intentBuilder.build();
+    }
+
+    private boolean sameIPVersion(IpPrefix p, IpPrefix q) {
+        return (p.isIp4() && q.isIp4()) || (p.isIp6() && q.isIp6());
+    }
+
+    private List<Key> relatedIntentKeys(
+            ResolvedRoute route) {
+        List<Key> keysList = new ArrayList<>();
+
+        // Find the attachment point (egress interface) of the next hop
+        Interface egressInterface =
+                interfaceService.getMatchingInterface(route.nextHop());
+        if (egressInterface == null) {
+            log.warn("No outgoing interface found for {}",
+                     route.nextHop());
+            return keysList;
+        }
+
+        // TODO this should be only peering interfaces
+        interfaceService.getInterfaces().forEach(ingressInterface -> {
+            // Get only ingress interfaces with IPs configured
+            if (validIngressIntf(ingressInterface, egressInterface)) {
+                //"ingressInterface" is now any peering interface other than the
+                // one we just received the announcement from
+                if (resolvedRoutesPerCP.containsKey(ingressInterface.connectPoint())) {
+                    resolvedRoutesPerCP.get(ingressInterface.connectPoint()).forEach(
+                            otherRoute -> {
+                                IpPrefix prefix = route.prefix();
+                                IpPrefix otherPrefix = otherRoute.prefix();
+
+                                Key key1 = Key.of(prefix + "-" + otherPrefix, appId);
+                                keysList.add(key1);
+                                Key key2 = Key.of(otherPrefix + "-" + prefix, appId);
+                                keysList.add(key2);
+                            }
+                    );
+                }
+            }
+        });
+
+        return keysList;
+    }
+
+    /*
+     * It removes route from the set associated to the CP it come from
+     */
+    private void removeLearnedRoutesFromCP(ResolvedRoute route) {
+        // Find the attachment point (egress interface) of the next hop
+        Interface egressInterface =
+                interfaceService.getMatchingInterface(route.nextHop());
+        if (egressInterface == null) {
+            log.warn("No outgoing interface found for {}",
+                     route.nextHop());
+            return;
+        }
+        ConnectPoint egressPort = egressInterface.connectPoint();
+
+        if (resolvedRoutesPerCP.containsKey(egressPort)  &&
+            resolvedRoutesPerCP.get(egressPort).contains(route)) {
+                resolvedRoutesPerCP.get(egressPort).remove(route);
+        }
+    }
+
+    /*
+     * It updates the association CP <-> set of routes, eventually deleting an
+     * old association to handle "routes mobility" (i.e. a better route for a
+     * known prefix has been found)
+     */
+    private void updateResolvedRoutesFromCP(ResolvedRoute route) {
+        // Find the attachment point (egress interface) of the next hop
+        Interface egressInterface =
+                interfaceService.getMatchingInterface(route.nextHop());
+        if (egressInterface == null) {
+            log.warn("No outgoing interface found for {}",
+                     route.nextHop());
+            return;
+        }
+        ConnectPoint egressPort = egressInterface.connectPoint();
+
+        if (isAlreadyKnownRoute(route, egressPort)) {
+            removeLearnedRoutesFromCP(route);
+        }
+
+        if (!resolvedRoutesPerCP.containsKey(egressPort)) {
+            resolvedRoutesPerCP.put(egressPort, Sets.newHashSet());
+        }
+        resolvedRoutesPerCP.get(egressPort).add(route);
+    }
+
+    /*
+     * It returns true if the route is already known from a different CP
+     */
+    private boolean isAlreadyKnownRoute(ResolvedRoute route, ConnectPoint knownCP) {
+        return resolvedRoutesPerCP.entrySet().stream()
+                .anyMatch(entry -> entry.getValue().contains(route) && !entry.getKey().equals(knownCP));
     }
 
     private class InternalRouteListener implements RouteListener {
